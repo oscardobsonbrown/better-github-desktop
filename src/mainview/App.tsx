@@ -571,15 +571,15 @@ function App() {
 												{expandedFiles.has(file.id) && (
 													<PatchDiff
 														patch={file.patch}
-														options={{
-															theme: isDarkMode ? "pierre-dark" : "pierre-light",
-															diffStyle: "split",
-															enableLineSelection: true,
-															disableFileHeader: true,
-															hunkSeparators: "line-info",
-															expansionLineCount: 50,
-															onLineSelectionEnd: handleLineSelectionEnd(file.name),
-														}}
+																		options={{
+																			theme: isDarkMode ? "pierre-dark" : "pierre-light",
+																			diffStyle: "split",
+																			enableLineSelection: true,
+																			disableFileHeader: true,
+																			hunkSeparators: "line-info",
+																			collapsedContextThreshold: 5,
+																			onLineSelectionEnd: handleLineSelectionEnd(file.name),
+																		}}
 													/>
 												)}
 											</div>
