@@ -5,3 +5,47 @@
 .scrollbar-stable {
 	scrollbar-gutter: stable;
 }
+
+/* Custom scrollbar for webkit browsers */
+::-webkit-scrollbar {
+	width: 12px;
+	height: 12px;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+	background: #d1d5db;
+	border-radius: 6px;
+	border: 3px solid transparent;
+	background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: #9ca3af;
+}
+
+/* Dark mode scrollbar */
+@media (prefers-color-scheme: dark) {
+	::-webkit-scrollbar-thumb {
+		background: #4b5563;
+	}
+	
+	::-webkit-scrollbar-thumb:hover {
+		background: #6b7280;
+	}
+}
+
+/* Firefox scrollbar */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: #d1d5db transparent;
+}
+
+@media (prefers-color-scheme: dark) {
+	* {
+		scrollbar-color: #4b5563 transparent;
+	}
+}
