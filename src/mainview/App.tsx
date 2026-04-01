@@ -1,7 +1,7 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
-import type { SelectedLineRange, FileContents } from "@pierre/diffs";
+import type { SelectedLineRange, FileContents, FileDiffMetadata } from "@pierre/diffs";
 import { ArrowsInSimple, ArrowsOutSimple } from "@phosphor-icons/react";
 
 interface FileChange {
@@ -317,6 +317,116 @@ async function validateToken(token: string): Promise<User> {
 }`,
 };
 
+// Compute diff lines from fileDiff
+function countLinesChanged(fileDiff: FileDiffMetadata) {
+	let added = 0;
+	let deleted = 0;
+	
+	for (const hunk of fileDiff.hunks) {
+		for (const content of hunk.hunkContent) {
+			if (content.type === "change") {
+				added += content.additions;
+				deleted += content.deletions;
+			}
+		}
+	}
+	
+	return { added, deleted };
+}
+
+interface FileDiffViewerProps {
+	file: FileChange;
+	isExpanded: boolean;
+	isDarkMode: boolean;
+	onToggleExpand: (id: string) => void;
+	onLineSelectionEnd: (fileName: string) => (range: SelectedLineRange | null) => void;
+	getStatusIcon: (status: FileChange["status"]) => React.ReactNode;
+}
+
+// Separate component to handle diff computation properly
+function FileDiffViewer({ file, isExpanded, isDarkMode, onToggleExpand, onLineSelectionEnd, getStatusIcon }: FileDiffViewerProps) {
+	// Create empty old file for new files
+	const oldFile = file.oldFile ?? { name: file.newFile.name, contents: "" };
+	
+	// Compute the diff
+	const fileDiff = parseDiffFromFile(oldFile, file.newFile);
+	
+	return (
+		<div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+			<button
+				onClick={() => onToggleExpand(file.id)}
+				className={`w-full bg-gray-100 dark:bg-gray-700 px-2.5 py-1 flex items-center justify-between hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors ${
+					isExpanded ? 'border-b border-gray-200 dark:border-gray-600' : ''
+				}`}
+			>
+				<div className="flex items-center gap-1.5">
+					<svg
+						className={`w-3 h-3 text-gray-500 dark:text-gray-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+						fill="none"
+						stroke="currentColor"
+						viewBox="0 0 24 24"
+					>
+						<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+					</svg>
+					{getStatusIcon(file.status)}
+					<span className="font-mono text-xs text-gray-700 dark:text-gray-300">{file.name}</span>
+				</div>
+			</button>
+			{isExpanded && (
+				<FileDiff
+					fileDiff={fileDiff}
+					options={{
+						theme: isDarkMode ? "pierre-dark" : "pierre-light",
+						diffStyle: "split",
+						enableLineSelection: true,
+						disableFileHeader: true,
+						onLineSelectionEnd: onLineSelectionEnd(file.name),
+					}}
+				/>
+			)}
+		</div>
+	);
+}
+
+interface FileListItemProps {
+	file: FileChange;
+	isChecked: boolean;
+	onToggle: () => void;
+	getStatusIcon: (status: FileChange["status"]) => React.ReactNode;
+}
+
+// Component to render a file item in the sidebar with diff line counts
+function FileListItem({ file, isChecked, onToggle, getStatusIcon }: FileListItemProps) {
+	// Compute the diff for line counting
+	const oldFile = file.oldFile ?? { name: file.newFile.name, contents: "" };
+	const fileDiff = parseDiffFromFile(oldFile, file.newFile);
+	const lineCount = countLinesChanged(fileDiff);
+	
+	return (
+		<div
+			onClick={onToggle}
+			className="flex items-center gap-3 px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer transition-colors"
+		>
+			<input
+				type="checkbox"
+				checked={isChecked}
+				onChange={onToggle}
+				className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-gray-900 dark:text-white focus:ring-gray-900 dark:bg-gray-700"
+			/>
+			{getStatusIcon(file.status)}
+			<span className="text-sm text-gray-700 dark:text-gray-300 truncate">{file.name}</span>
+			<div className="flex items-center gap-1.5 text-xs ml-auto">
+				{lineCount.added > 0 && (
+					<span className="text-green-600 dark:text-green-400 font-medium">+{lineCount.added}</span>
+				)}
+				{lineCount.deleted > 0 && (
+					<span className="text-red-600 dark:text-red-400 font-medium">-{lineCount.deleted}</span>
+				)}
+			</div>
+		</div>
+	);
+}
+
 function App() {
 	const [activeTab, setActiveTab] = useState<"changes" | "history">("changes");
 	const [files, setFiles] = useState<FileChange[]>([
@@ -361,16 +471,6 @@ function App() {
 
 	const collapseAll = () => {
 		setExpandedFiles(new Set());
-	};
-
-	const countLinesChanged = (oldFile: FileContents | null, newFile: FileContents) => {
-		// Simple line count comparison
-		const oldLines = oldFile ? oldFile.contents.split('\n').length : 0;
-		const newLines = newFile.contents.split('\n').length;
-		const added = Math.max(0, newLines - oldLines);
-		const deleted = Math.max(0, oldLines - newLines);
-		// This is approximate - real diff would be more accurate
-		return { added: newLines - (oldFile ? 0 : newLines) + added, deleted: oldFile ? deleted : 0 };
 	};
 
 	const getStatusIcon = (status: FileChange["status"]) => {
@@ -553,249 +653,194 @@ function App() {
 					{activeTab === "changes" && (
 						<>
 							<div className="flex-1 overflow-auto py-2 scrollbar-stable">
-								{files.map((file) => {
-									const lineCount = countLinesChanged(file.oldFile, file.newFile);
-									return (
-									<div
+								{files.map((file) => (
+									<FileListItem
 										key={file.id}
-										onClick={() => toggleFile(file.id)}
-										className="flex items-center gap-3 px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer transition-colors"
-									>
-										<input
-											type="checkbox"
-											checked={file.checked}
-											onChange={() => toggleFile(file.id)}
-											className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-gray-900 dark:text-white focus:ring-gray-900 dark:bg-gray-700"
-										/>
-										{getStatusIcon(file.status)}
-										<span className="text-sm text-gray-700 dark:text-gray-300 truncate">{file.name}</span>
-										<div className="flex items-center gap-1.5 text-xs ml-auto">
-											{lineCount.added > 0 && (
-												<span className="text-green-600 dark:text-green-400 font-medium">+{lineCount.added}</span>
-											)}
-											{lineCount.deleted > 0 && (
-												<span className="text-red-600 dark:text-red-400 font-medium">-{lineCount.deleted}</span>
-											)}
-										</div>
-									</div>
-									);
-								})}
+										file={file}
+										isChecked={file.checked}
+										onToggle={() => toggleFile(file.id)}
+										getStatusIcon={getStatusIcon}
+									/>
+								))}
 							</div>
 
 							<div className="border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-900">
 								<div className="flex items-center gap-3 mb-3">
 									<div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500" />
 									<input
-										type="text"
-										value={commitSummary}
-										onChange={(e) => setCommitSummary(e.target.value)}
-										placeholder="Summary (required)"
-										className="flex-1 px-3 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent dark:bg-gray-800 dark:text-white"
-									/>
-								</div>
-								<textarea
-									value={commitDescription}
-									onChange={(e) => setCommitDescription(e.target.value)}
-									placeholder="Description"
-									rows={3}
-									className="w-full px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-md resize-none focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent dark:bg-gray-800 dark:text-white mb-3"
-								/>
-								<button
-									disabled={!commitSummary || files.every((f) => !f.checked)}
-									className="w-full py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm font-medium rounded-md hover:bg-gray-800 dark:hover:bg-gray-200 disabled:bg-gray-200 dark:disabled:bg-gray-800 disabled:text-gray-400 dark:disabled:text-gray-600 disabled:cursor-not-allowed transition-colors"
-								>
-									Commit to feature/ui-redesign
-								</button>
-							</div>
-						</>
-					)}
-
-					{activeTab === "history" && (
-						<div className="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-500">
-							<div className="text-center">
-								<svg className="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-								</svg>
-								<p className="text-sm">Commit history will appear here</p>
-							</div>
-						</div>
-					)}
-				</div>
-
-				{/* Right Content Area - Diffs */}
-				<div className="flex-1 bg-white dark:bg-gray-900 flex flex-col overflow-hidden">
-					{/* Toolbar */}
-					{checkedFiles.length > 0 && (
-						<div className="h-10 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between px-4 bg-white dark:bg-gray-900 flex-shrink-0">
-							<span className="text-sm text-gray-500 dark:text-gray-400">
-								{checkedFiles.length} file{checkedFiles.length !== 1 ? 's' : ''}
-							</span>
-							<div className="flex items-center gap-2">
-								{notes.length > 0 && (
-									<button
-										onClick={handleCopyToLLM}
-										disabled={notes.length === 0}
-										className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-											notes.length === 0
-												? "text-gray-400 cursor-not-allowed"
-												: "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
-										}`}
-									>
-										{isCopied ? "Copied!" : "Copy notes"}
-									</button>
-									)}
-								<button
-									onClick={toggleAll}
-									className="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md transition-colors"
-									title={areAllExpanded ? "Collapse all" : "Expand all"}
-								>
-									{areAllExpanded ? (
-										<ArrowsInSimple className="w-4 h-4" weight="bold" />
-									) : (
-										<ArrowsOutSimple className="w-4 h-4" weight="bold" />
-									)}
-								</button>
-							</div>
-						</div>
-					)}
-					<div className="flex-1 overflow-auto scrollbar-stable">
-						<div className="pl-3.5 pr-1 pb-6 pt-2 space-y-3">
-							{checkedFiles.length === 0 ? (
-								<div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
-									<div className="text-center">
-										<svg className="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-											<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-										</svg>
-										<p className="text-lg font-medium text-gray-600 dark:text-gray-400">No files selected</p>
-										<p className="text-sm mt-2">Check files in the sidebar to view diffs</p>
+											type="text"
+											value={commitSummary}
+											onChange={(e) => setCommitSummary(e.target.value)}
+											placeholder="Summary (required)"
+											className="flex-1 px-3 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent dark:bg-gray-800 dark:text-white"
+										/>
 									</div>
+									<textarea
+										value={commitDescription}
+										onChange={(e) => setCommitDescription(e.target.value)}
+										placeholder="Description"
+										rows={3}
+										className="w-full px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-md resize-none focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent dark:bg-gray-800 dark:text-white mb-3"
+									/>
+									<button
+										disabled={!commitSummary || files.every((f) => !f.checked)}
+										className="w-full py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm font-medium rounded-md hover:bg-gray-800 dark:hover:bg-gray-200 disabled:bg-gray-200 dark:disabled:bg-gray-800 disabled:text-gray-400 dark:disabled:text-gray-600 disabled:cursor-not-allowed transition-colors"
+									>
+										Commit to feature/ui-redesign
+									</button>
 								</div>
-							) : (
-								<>
-								{checkedFiles.map((file) => {
-									const fileDiff = useMemo(() => {
-										if (file.oldFile) {
-											return parseDiffFromFile(file.oldFile, file.newFile);
-										}
-										// For new files, create a diff with empty old file
-										const emptyOldFile: FileContents = {
-											name: file.newFile.name,
-											contents: ""
-										};
-										return parseDiffFromFile(emptyOldFile, file.newFile);
-									}, [file]);
-									return (
-									<div key={file.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+							</>
+						)}
+
+						{activeTab === "history" && (
+							<div className="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-500">
+								<div className="text-center">
+									<svg className="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+									</svg>
+									<p className="text-sm">Commit history will appear here</p>
+								</div>
+							</div>
+						)}
+					</div>
+
+					{/* Right Content Area - Diffs */}
+					<div className="flex-1 bg-white dark:bg-gray-900 flex flex-col overflow-hidden">
+						{/* Toolbar */}
+						{checkedFiles.length > 0 && (
+							<div className="h-10 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between px-4 bg-white dark:bg-gray-900 flex-shrink-0">
+								<span className="text-sm text-gray-500 dark:text-gray-400">
+									{checkedFiles.length} file{checkedFiles.length !== 1 ? 's' : ''}
+								</span>
+								<div className="flex items-center gap-2">
+									{notes.length > 0 && (
 										<button
-											onClick={() => toggleFileExpand(file.id)}
-											className={`w-full bg-gray-100 dark:bg-gray-700 px-2.5 py-1 flex items-center justify-between hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors ${
-												expandedFiles.has(file.id) ? 'border-b border-gray-200 dark:border-gray-600' : ''
+											onClick={handleCopyToLLM}
+											disabled={notes.length === 0}
+											className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+												notes.length === 0
+													? "text-gray-400 cursor-not-allowed"
+													: "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
 											}`}
 										>
-											<div className="flex items-center gap-1.5">
-												<svg
-													className={`w-3 h-3 text-gray-500 dark:text-gray-400 transition-transform ${expandedFiles.has(file.id) ? 'rotate-180' : ''}`}
-													fill="none"
-													stroke="currentColor"
-													viewBox="0 0 24 24"
-												>
-													<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-												</svg>
-												{getStatusIcon(file.status)}
-												<span className="font-mono text-xs text-gray-700 dark:text-gray-300">{file.name}</span>
-											</div>
+											{isCopied ? "Copied!" : "Copy notes"}
 										</button>
-										{expandedFiles.has(file.id) && (
-											<FileDiff
-												fileDiff={fileDiff}
-												options={{
-													theme: isDarkMode ? "pierre-dark" : "pierre-light",
-													diffStyle: "split",
-													enableLineSelection: true,
-													disableFileHeader: true,
-													onLineSelectionEnd: handleLineSelectionEnd(file.name),
-												}}
-											/>
 										)}
+									<button
+										onClick={toggleAll}
+										className="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md transition-colors"
+										title={areAllExpanded ? "Collapse all" : "Expand all"}
+									>
+										{areAllExpanded ? (
+											<ArrowsInSimple className="w-4 h-4" weight="bold" />
+										) : (
+											<ArrowsOutSimple className="w-4 h-4" weight="bold" />
+										)}
+									</button>
+								</div>
+							</div>
+						)}
+						<div className="flex-1 overflow-auto scrollbar-stable">
+							<div className="pl-3.5 pr-1 pb-6 pt-2 space-y-3">
+								{checkedFiles.length === 0 ? (
+									<div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+										<div className="text-center">
+											<svg className="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+												<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+											</svg>
+											<p className="text-lg font-medium text-gray-600 dark:text-gray-400">No files selected</p>
+											<p className="text-sm mt-2">Check files in the sidebar to view diffs</p>
+										</div>
 									</div>
-									);
-								})}
-								</>
+								) : (
+									<>
+									{checkedFiles.map((file) => (
+										<FileDiffViewer
+											key={file.id}
+											file={file}
+											isExpanded={expandedFiles.has(file.id)}
+											isDarkMode={isDarkMode}
+											onToggleExpand={toggleFileExpand}
+											onLineSelectionEnd={handleLineSelectionEnd}
+											getStatusIcon={getStatusIcon}
+										/>
+										))}
+									</>
+									)}
+								</div>
+							</div>
+						</div>
+
+						{/* Note Modal */}
+						{isModalOpen && selectedRange && (
+							<div className="fixed inset-0 bg-black/50 dark:bg-black/70 flex items-center justify-center z-50">
+								<div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4">
+									<div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+										<h3 className="text-lg font-semibold text-gray-900 dark:text-white">Add Note</h3>
+										<p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+											{selectedRange.fileName} • Lines {selectedRange.range?.start}-{selectedRange.range?.end}
+											{selectedRange.range?.side && ` (${selectedRange.range.side})`}
+										</p>
+									</div>
+									<div className="p-6">
+										<textarea
+											value={noteText}
+											onChange={(e) => setNoteText(e.target.value)}
+											placeholder="Enter your note about this code..."
+											className="w-full h-32 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg resize-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent outline-none dark:bg-gray-700 dark:text-white"
+											autoFocus
+										/>
+									</div>
+									<div className="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex justify-end gap-3">
+										<button
+											onClick={closeModal}
+											className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+										>
+											Cancel
+										</button>
+										<button
+											onClick={handleSaveNote}
+											disabled={!noteText.trim()}
+											className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+												noteText.trim() ? "bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-200" : "bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed"
+											}`}
+										>
+											Save Note
+										</button>
+									</div>
+								</div>
+							</div>
+						)}
+
+						{/* Notes Panel */}
+						{notes.length > 0 && (
+							<div className="fixed right-4 bottom-4 w-80 max-h-[60vh] overflow-auto bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-4 z-20">
+								<div className="flex items-center justify-between mb-3">
+									<h3 className="font-semibold text-gray-900 dark:text-white">Notes ({notes.length})</h3>
+								</div>
+								<div className="space-y-3">
+									{notes.map((note) => (
+										<div key={note.id} className="p-3 bg-gray-50 dark:bg-gray-700 rounded border border-gray-200 dark:border-gray-600 text-sm">
+											<div className="flex items-center justify-between mb-1">
+												<span className="font-medium text-gray-700 dark:text-gray-300">{note.fileName.split("/").pop()}</span>
+												<button
+													onClick={() => handleDeleteNote(note.id)}
+													className="text-red-500 hover:text-red-700"
+												>
+													×
+												</button>
+											</div>
+											<div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+												Lines {note.startLine}-{note.endLine}{note.side && ` (${note.side})`}
+											</div>
+											<p className="text-gray-800 dark:text-gray-200">{note.note}</p>
+										</div>
+									))}
+									</div>
+								</div>
 							)}
 						</div>
 					</div>
-				</div>
-
-				{/* Note Modal */}
-				{isModalOpen && selectedRange && (
-					<div className="fixed inset-0 bg-black/50 dark:bg-black/70 flex items-center justify-center z-50">
-						<div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4">
-							<div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-								<h3 className="text-lg font-semibold text-gray-900 dark:text-white">Add Note</h3>
-								<p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-									{selectedRange.fileName} • Lines {selectedRange.range?.start}-{selectedRange.range?.end}
-									{selectedRange.range?.side && ` (${selectedRange.range.side})`}
-								</p>
-							</div>
-							<div className="p-6">
-								<textarea
-									value={noteText}
-									onChange={(e) => setNoteText(e.target.value)}
-									placeholder="Enter your note about this code..."
-									className="w-full h-32 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg resize-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-gray-100 focus:border-transparent outline-none dark:bg-gray-700 dark:text-white"
-									autoFocus
-								/>
-							</div>
-							<div className="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex justify-end gap-3">
-								<button
-									onClick={closeModal}
-									className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
-								>
-									Cancel
-								</button>
-								<button
-									onClick={handleSaveNote}
-									disabled={!noteText.trim()}
-									className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-										noteText.trim() ? "bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-200" : "bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed"
-									}`}
-								>
-									Save Note
-								</button>
-							</div>
-						</div>
-					</div>
-				)}
-
-				{/* Notes Panel */}
-				{notes.length > 0 && (
-					<div className="fixed right-4 bottom-4 w-80 max-h-[60vh] overflow-auto bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-4 z-20">
-						<div className="flex items-center justify-between mb-3">
-							<h3 className="font-semibold text-gray-900 dark:text-white">Notes ({notes.length})</h3>
-						</div>
-						<div className="space-y-3">
-							{notes.map((note) => (
-								<div key={note.id} className="p-3 bg-gray-50 dark:bg-gray-700 rounded border border-gray-200 dark:border-gray-600 text-sm">
-									<div className="flex items-center justify-between mb-1">
-										<span className="font-medium text-gray-700 dark:text-gray-300">{note.fileName.split("/").pop()}</span>
-										<button
-											onClick={() => handleDeleteNote(note.id)}
-											className="text-red-500 hover:text-red-700"
-										>
-											×
-										</button>
-									</div>
-									<div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
-										Lines {note.startLine}-{note.endLine}{note.side && ` (${note.side})`}
-									</div>
-									<p className="text-gray-800 dark:text-gray-200">{note.note}</p>
-								</div>
-							))}
-						</div>
-					</div>
-				)}
-			</div>
-		</div>
 	);
 }
 
