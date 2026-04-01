@@ -20,126 +20,127 @@ interface Note {
 	note: string;
 }
 
-// Sample diff with 25 context lines to demonstrate expansion
-const SAMPLE_DIFF_1 = `diff --git a/src/components/Button.tsx b/src/components/Button.tsx
-index 1234567..abcdefg 100644
---- a/src/components/Button.tsx
-+++ b/src/components/Button.tsx
-@@ -1,25 +1,35 @@
- import React from 'react';
+// Multi-hunk diff - changes separated by 20+ lines to show expand buttons
+const SAMPLE_DIFF_1 = `diff --git a/src/services/UserService.ts b/src/services/UserService.ts
+index 1111111..2222222 100644
+--- a/src/services/UserService.ts
++++ b/src/services/UserService.ts
+@@ -1,5 +1,7 @@
+ import { Injectable } from '@nestjs/common';
+ import { Repository } from 'typeorm';
++import { RedisService } from './RedisService';
++import { LoggerService } from './LoggerService';
+ import { InjectRepository } from '@nestjs/typeorm';
+ import { User } from '../entities/User';
+ import { EmailService } from './EmailService';
+@@ -10,20 +12,25 @@ export class UserService {
+   constructor(
+     @InjectRepository(User)
+     private userRepo: Repository<User>,
++    private redis: RedisService,
++    private logger: LoggerService,
+     private emailService: EmailService,
+   ) {}
  
-+// Types for button component
- interface ButtonProps {
-   label: string;
-   onClick: () => void;
-+  variant?: 'primary' | 'secondary';
-+  disabled?: boolean;
- }
- 
- /**
-  * Button component for user interactions
-  * Supports multiple variants and states
-  */
--export const Button: React.FC<ButtonProps> = ({ label, onClick }) => {
-+export const Button: React.FC<ButtonProps> = ({ 
-+  label, 
-+  onClick, 
-+  variant = 'primary',
-+  disabled = false 
-+}) => {
-   return (
-     <button 
-       onClick={onClick}
--      className="px-4 py-2 bg-blue-500 text-white rounded"
-+      className={\`px-4 py-2 rounded \${
-+        variant === 'primary' 
-+          ? 'bg-blue-500 text-white' 
-+          : 'bg-gray-200 text-gray-800'
-+      } \${disabled ? 'opacity-50 cursor-not-allowed' : ''}\`}
-+      disabled={disabled}
-     >
-       {label}
-     </button>
-   );
- };
- 
- export default Button;
-+// End of Button component`;
-
-// API diff with 25 context lines
-const SAMPLE_DIFF_2 = `diff --git a/src/utils/api.ts b/src/utils/api.ts
-index 2345678..bcdefgh 100644
---- a/src/utils/api.ts
-+++ b/src/utils/api.ts
-@@ -1,25 +1,45 @@
- import { User } from '../types';
- 
-+// API response wrapper
- export interface ApiResponse<T> {
-   data?: T;
-   error?: string;
- }
- 
- /**
-  * Fetch user by ID
-  * Makes authenticated request to user endpoint
-  */
--export async function fetchUser(id: string): Promise<ApiResponse<User>> {
--  const response = await fetch(\`/api/users/\${id}\`);
-+export async function fetchWithAuth<T>(
-+  url: string, 
-+  options?: RequestInit
-+): Promise<ApiResponse<T>> {
-+  const token = localStorage.getItem('auth_token');
-+  
-+  const response = await fetch(url, {
-+    ...options,
-+    headers: {
-+      ...options?.headers,
-+      'Authorization': token ? \`Bearer \${token}\` : '',
-+      'Content-Type': 'application/json',
-+    },
-+  });
-+  
-   if (!response.ok) {
--    throw new Error('Failed to fetch user');
-+    const error = await response.json();
-+    throw new Error(error.message || 'Request failed');
+   async findById(id: string): Promise<User | null> {
+-    return this.userRepo.findOne({ where: { id } });
++    this.logger.log('Finding user: ' + id);
++    const cached = await this.redis.get('user:' + id);
++    if (cached) return JSON.parse(cached);
++    const user = await this.userRepo.findOne({ where: { id } });
++    if (user) await this.redis.setex('user:' + id, 3600, JSON.stringify(user));
++    return user;
    }
--  return response.json();
-+  
-+  return { data: await response.json(), error: undefined };
-+}
-+
-+export async function fetchUser(id: string): Promise<ApiResponse<User>> {
-+  return fetchWithAuth<User>(\`/api/users/\${id}\`);
- }
  
- export async function updateUser(
-   id: string, 
-   data: Partial<User>
- ): Promise<ApiResponse<User>> {
--  const response = await fetch(\`/api/users/\${id}\`, {
--    method: 'PATCH',
--    body: JSON.stringify(data),
--  });
--  return response.json();
-+  return fetchWithAuth<User>(\`/api/users/\${id}\`, {
-+    method: 'PATCH', 
-+    body: JSON.stringify(data)
-+  });
+-  async findByEmail(email: string): Promise<User | null> {
+-    return this.userRepo.findOne({ where: { email } });
+-  }
+-
+   async create(data: CreateUserDto): Promise<User> {
++    this.logger.log('Creating user: ' + data.email);
+     const user = this.userRepo.create(data);
+-    return this.userRepo.save(user);
++    const saved = await this.userRepo.save(user);
++    await this.redis.setex('user:' + saved.id, 3600, JSON.stringify(saved));
++    return saved;
+   }
+ 
+   async update(id: string, data: UpdateUserDto): Promise<User> {
+@@ -45,10 +52,15 @@ export class UserService {
+     return updated;
+   }
+ 
+   async delete(id: string): Promise<void> {
++    this.logger.log('Deleting user: ' + id);
+     const user = await this.findById(id);
+     if (!user) throw new Error('User not found');
+     await this.userRepo.remove(user);
++    await this.redis.del('user:' + id);
+   }
  }`;
 
-// Auth hook diff with lots of context
+// Second diff - API service with separated changes
+const SAMPLE_DIFF_2 = `diff --git a/src/services/ApiService.ts b/src/services/ApiService.ts
+index 3333333..4444444 100644
+--- a/src/services/ApiService.ts
++++ b/src/services/ApiService.ts
+@@ -1,5 +1,8 @@
+ import axios from 'axios';
++import { MetricsService } from './MetricsService';
++import { ErrorReporter } from './ErrorReporter';
++
+ const API_BASE_URL = process.env.API_URL || 'http://localhost:3000';
+ 
+ export interface ApiConfig {
+@@ -15,10 +18,15 @@ export class ApiService {
+   private client = axios.create({
+     baseURL: API_BASE_URL,
+     timeout: 30000,
++    headers: {
++      'X-API-Version': 'v2',
++    }
+   });
+ 
+   constructor(
+     private config: ApiConfig,
++    private metrics: MetricsService,
++    private errorReporter: ErrorReporter,
+   ) {}
+ 
+   async get<T>(path: string): Promise<T> {
+@@ -28,7 +36,10 @@ export class ApiService {
+   }
+ 
+   async post<T>(path: string, data: unknown): Promise<T> {
++    this.metrics.increment('api.post');
+     const response = await this.client.post<T>(path, data);
++    this.metrics.timing('api.post.duration', response.config.timeout || 0);
+     return response.data;
+   }
+ 
+@@ -50,10 +61,15 @@ export class ApiService {
+   }
+ 
+   private handleError(error: unknown): never {
++    this.errorReporter.report(error);
+     if (axios.isAxiosError(error)) {
++      this.metrics.increment('api.error');
+       throw new Error(error.response?.data?.message || error.message);
+     }
++    this.metrics.increment('api.unknown_error');
+     throw error;
+   }
+ }`;
+
+// Third diff - Auth hook with context
 const SAMPLE_DIFF_3 = `diff --git a/src/hooks/useAuth.ts b/src/hooks/useAuth.ts
 new file mode 100644
-index 0000000..1234567
+index 0000000..5555555
 --- /dev/null
 +++ b/src/hooks/useAuth.ts
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,85 @@
 +import { useState, useEffect, createContext, useContext } from 'react';
 +
-+// Types for auth context
 +interface User {
 +  id: string;
 +  email: string;
@@ -153,15 +154,12 @@ index 0000000..1234567
 +  isLoading: boolean;
 +}
 +
-+// Create auth context
 +const AuthContext = createContext<AuthContextType | undefined>(undefined);
 +
-+// Auth provider component
 +export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 +  const [user, setUser] = useState<User | null>(null);
 +  const [isLoading, setIsLoading] = useState(true);
 +
-+  // Check for existing auth on mount
 +  useEffect(() => {
 +    const token = localStorage.getItem('auth_token');
 +    if (token) {
@@ -171,7 +169,6 @@ index 0000000..1234567
 +    }
 +  }, []);
 +
-+  // Login handler
 +  const login = async (email: string, password: string) => {
 +    const response = await fetch('/api/auth/login', {
 +      method: 'POST',
@@ -182,7 +179,6 @@ index 0000000..1234567
 +    setUser(user);
 +  };
 +
-+  // Logout handler
 +  const logout = () => {
 +    localStorage.removeItem('auth_token');
 +    setUser(null);
@@ -195,18 +191,28 @@ index 0000000..1234567
 +  );
 +};
 +
-+// Custom hook to use auth context
 +export const useAuth = () => {
 +  const context = useContext(AuthContext);
 +  if (!context) throw new Error('useAuth must be used within AuthProvider');
 +  return context;
-+};`;
++};
++
++async function validateToken(token: string): Promise<User> {
++  const response = await fetch('/api/auth/validate', {
++    headers: { Authorization: 'Bearer ' + token },
++  });
++  if (!response.ok) {
++    localStorage.removeItem('auth_token');
++    throw new Error('Invalid token');
++  }
++  return response.json();
++}`;
 
 function App() {
 	const [activeTab, setActiveTab] = useState<"changes" | "history">("changes");
 	const [files, setFiles] = useState<FileChange[]>([
-		{ id: "1", name: "src/components/Button.tsx", checked: true, status: "modified", patch: SAMPLE_DIFF_1 },
-		{ id: "2", name: "src/utils/api.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_2 },
+		{ id: "1", name: "src/services/UserService.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_1 },
+		{ id: "2", name: "src/services/ApiService.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_2 },
 		{ id: "3", name: "src/hooks/useAuth.ts", checked: false, status: "added", patch: SAMPLE_DIFF_3 },
 	]);
 	const [commitSummary, setCommitSummary] = useState("");
@@ -589,6 +595,7 @@ function App() {
 														diffStyle: "split",
 														enableLineSelection: true,
 														disableFileHeader: true,
+														hunkSeparators: "line-info",
 														onLineSelectionEnd: handleLineSelectionEnd(file.name),
 													}}
 												/>
