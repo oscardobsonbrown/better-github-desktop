@@ -8,6 +8,7 @@ interface FileChange {
 	name: string;
 	checked: boolean;
 	status: "modified" | "added" | "deleted" | "untracked";
+	fullPatch: string;
 	patch: string;
 }
 
@@ -172,9 +173,9 @@ index 0000000..1234567
 function App() {
 	const [activeTab, setActiveTab] = useState<"changes" | "history">("changes");
 	const [files, setFiles] = useState<FileChange[]>([
-		{ id: "1", name: "src/components/Button.tsx", checked: true, status: "modified", patch: SAMPLE_DIFF_1 },
-		{ id: "2", name: "src/utils/api.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_2 },
-		{ id: "3", name: "src/hooks/useAuth.ts", checked: false, status: "added", patch: SAMPLE_DIFF_3 },
+		{ id: "1", name: "src/components/Button.tsx", checked: true, status: "modified", fullPatch: SAMPLE_DIFF_1, patch: SAMPLE_DIFF_1 },
+		{ id: "2", name: "src/utils/api.ts", checked: true, status: "modified", fullPatch: SAMPLE_DIFF_2, patch: SAMPLE_DIFF_2 },
+		{ id: "3", name: "src/hooks/useAuth.ts", checked: false, status: "added", fullPatch: SAMPLE_DIFF_3, patch: SAMPLE_DIFF_3 },
 	]);
 	const [commitSummary, setCommitSummary] = useState("");
 	const [commitDescription, setCommitDescription] = useState("");
@@ -551,13 +552,15 @@ function App() {
 											{expandedFiles.has(file.id) && (
 												<PatchDiff
 													patch={file.patch}
-																options={{
-																	theme: isDarkMode ? "pierre-dark" : "pierre-light",
-																	diffStyle: "split",
-																	enableLineSelection: true,
-																	disableFileHeader: true,
-																	onLineSelectionEnd: handleLineSelectionEnd(file.name),
-																}}
+													options={{
+														theme: isDarkMode ? "pierre-dark" : "pierre-light",
+														diffStyle: "split",
+														enableLineSelection: true,
+														disableFileHeader: true,
+														hunkSeparators: "line-info",
+														expansionLineCount: 50,
+														onLineSelectionEnd: handleLineSelectionEnd(file.name),
+													}}
 												/>
 											)}
 										</div>
