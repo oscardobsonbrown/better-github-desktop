@@ -1,6 +1,7 @@
-import { useState, useCallback, useEffect } from "react";
-import { PatchDiff } from "@pierre/diffs/react";
-import type { SelectedLineRange } from "@pierre/diffs";
+import { useState, useCallback, useEffect, useMemo } from "react";
+import { FileDiff } from "@pierre/diffs/react";
+import { parseDiffFromFile } from "@pierre/diffs";
+import type { SelectedLineRange, FileContents } from "@pierre/diffs";
 import { ArrowsInSimple, ArrowsOutSimple } from "@phosphor-icons/react";
 
 interface FileChange {
@@ -8,7 +9,8 @@ interface FileChange {
 	name: string;
 	checked: boolean;
 	status: "modified" | "added" | "deleted" | "untracked";
-	patch: string;
+	oldFile: FileContents | null;
+	newFile: FileContents;
 }
 
 interface Note {
@@ -20,200 +22,307 @@ interface Note {
 	note: string;
 }
 
-// Multi-hunk diff - changes separated by 20+ lines to show expand buttons
-const SAMPLE_DIFF_1 = `diff --git a/src/services/UserService.ts b/src/services/UserService.ts
-index 1111111..2222222 100644
---- a/src/services/UserService.ts
-+++ b/src/services/UserService.ts
-@@ -1,5 +1,7 @@
- import { Injectable } from '@nestjs/common';
- import { Repository } from 'typeorm';
-+import { RedisService } from './RedisService';
-+import { LoggerService } from './LoggerService';
- import { InjectRepository } from '@nestjs/typeorm';
- import { User } from '../entities/User';
- import { EmailService } from './EmailService';
-@@ -10,20 +12,25 @@ export class UserService {
-   constructor(
-     @InjectRepository(User)
-     private userRepo: Repository<User>,
-+    private redis: RedisService,
-+    private logger: LoggerService,
-     private emailService: EmailService,
-   ) {}
- 
-   async findById(id: string): Promise<User | null> {
--    return this.userRepo.findOne({ where: { id } });
-+    this.logger.log('Finding user: ' + id);
-+    const cached = await this.redis.get('user:' + id);
-+    if (cached) return JSON.parse(cached);
-+    const user = await this.userRepo.findOne({ where: { id } });
-+    if (user) await this.redis.setex('user:' + id, 3600, JSON.stringify(user));
-+    return user;
-   }
- 
--  async findByEmail(email: string): Promise<User | null> {
--    return this.userRepo.findOne({ where: { email } });
--  }
--
-   async create(data: CreateUserDto): Promise<User> {
-+    this.logger.log('Creating user: ' + data.email);
-     const user = this.userRepo.create(data);
--    return this.userRepo.save(user);
-+    const saved = await this.userRepo.save(user);
-+    await this.redis.setex('user:' + saved.id, 3600, JSON.stringify(saved));
-+    return saved;
-   }
- 
-   async update(id: string, data: UpdateUserDto): Promise<User> {
-@@ -45,10 +52,15 @@ export class UserService {
-     return updated;
-   }
- 
-   async delete(id: string): Promise<void> {
-+    this.logger.log('Deleting user: ' + id);
-     const user = await this.findById(id);
-     if (!user) throw new Error('User not found');
-     await this.userRepo.remove(user);
-+    await this.redis.del('user:' + id);
-   }
- }`;
+// Complete file contents for UserService - old version
+const USER_SERVICE_OLD: FileContents = {
+	name: "src/services/UserService.ts",
+	contents: `import { Injectable } from '@nestjs/common';
+import { Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+import { User } from '../entities/User';
+import { EmailService } from './EmailService';
 
-// Second diff - API service with separated changes
-const SAMPLE_DIFF_2 = `diff --git a/src/services/ApiService.ts b/src/services/ApiService.ts
-index 3333333..4444444 100644
---- a/src/services/ApiService.ts
-+++ b/src/services/ApiService.ts
-@@ -1,5 +1,8 @@
- import axios from 'axios';
-+import { MetricsService } from './MetricsService';
-+import { ErrorReporter } from './ErrorReporter';
-+
- const API_BASE_URL = process.env.API_URL || 'http://localhost:3000';
- 
- export interface ApiConfig {
-@@ -15,10 +18,15 @@ export class ApiService {
-   private client = axios.create({
-     baseURL: API_BASE_URL,
-     timeout: 30000,
-+    headers: {
-+      'X-API-Version': 'v2',
-+    }
-   });
- 
-   constructor(
-     private config: ApiConfig,
-+    private metrics: MetricsService,
-+    private errorReporter: ErrorReporter,
-   ) {}
- 
-   async get<T>(path: string): Promise<T> {
-@@ -28,7 +36,10 @@ export class ApiService {
-   }
- 
-   async post<T>(path: string, data: unknown): Promise<T> {
-+    this.metrics.increment('api.post');
-     const response = await this.client.post<T>(path, data);
-+    this.metrics.timing('api.post.duration', response.config.timeout || 0);
-     return response.data;
-   }
- 
-@@ -50,10 +61,15 @@ export class ApiService {
-   }
- 
-   private handleError(error: unknown): never {
-+    this.errorReporter.report(error);
-     if (axios.isAxiosError(error)) {
-+      this.metrics.increment('api.error');
-       throw new Error(error.response?.data?.message || error.message);
-     }
-+    this.metrics.increment('api.unknown_error');
-     throw error;
-   }
- }`;
+@Injectable()
+export class UserService {
+  constructor(
+    @InjectRepository(User)
+    private userRepo: Repository<User>,
+    private emailService: EmailService,
+  ) {}
 
-// Third diff - Auth hook with context
-const SAMPLE_DIFF_3 = `diff --git a/src/hooks/useAuth.ts b/src/hooks/useAuth.ts
-new file mode 100644
-index 0000000..5555555
---- /dev/null
-+++ b/src/hooks/useAuth.ts
-@@ -0,0 +1,85 @@
-+import { useState, useEffect, createContext, useContext } from 'react';
-+
-+interface User {
-+  id: string;
-+  email: string;
-+  name: string;
-+}
-+
-+interface AuthContextType {
-+  user: User | null;
-+  login: (email: string, password: string) => Promise<void>;
-+  logout: () => void;
-+  isLoading: boolean;
-+}
-+
-+const AuthContext = createContext<AuthContextType | undefined>(undefined);
-+
-+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-+  const [user, setUser] = useState<User | null>(null);
-+  const [isLoading, setIsLoading] = useState(true);
-+
-+  useEffect(() => {
-+    const token = localStorage.getItem('auth_token');
-+    if (token) {
-+      validateToken(token).then(setUser).finally(() => setIsLoading(false));
-+    } else {
-+      setIsLoading(false);
-+    }
-+  }, []);
-+
-+  const login = async (email: string, password: string) => {
-+    const response = await fetch('/api/auth/login', {
-+      method: 'POST',
-+      body: JSON.stringify({ email, password }),
-+    });
-+    const { token, user } = await response.json();
-+    localStorage.setItem('auth_token', token);
-+    setUser(user);
-+  };
-+
-+  const logout = () => {
-+    localStorage.removeItem('auth_token');
-+    setUser(null);
-+  };
-+
-+  return (
-+    <AuthContext.Provider value={{ user, login, logout, isLoading }}>
-+      {children}
-+    </AuthContext.Provider>
-+  );
-+};
-+
-+export const useAuth = () => {
-+  const context = useContext(AuthContext);
-+  if (!context) throw new Error('useAuth must be used within AuthProvider');
-+  return context;
-+};
-+
-+async function validateToken(token: string): Promise<User> {
-+  const response = await fetch('/api/auth/validate', {
-+    headers: { Authorization: 'Bearer ' + token },
-+  });
-+  if (!response.ok) {
-+    localStorage.removeItem('auth_token');
-+    throw new Error('Invalid token');
-+  }
-+  return response.json();
-+}`;
+  async findById(id: string): Promise<User | null> {
+    return this.userRepo.findOne({ where: { id } });
+  }
+
+  async findByEmail(email: string): Promise<User | null> {
+    return this.userRepo.findOne({ where: { email } });
+  }
+
+  async create(data: CreateUserDto): Promise<User> {
+    const user = this.userRepo.create(data);
+    return this.userRepo.save(user);
+  }
+
+  async update(id: string, data: UpdateUserDto): Promise<User> {
+    const user = await this.findById(id);
+    if (!user) {
+      throw new Error('User not found');
+    }
+    Object.assign(user, data);
+    return this.userRepo.save(user);
+  }
+
+  async delete(id: string): Promise<void> {
+    const user = await this.findById(id);
+    if (!user) throw new Error('User not found');
+    await this.userRepo.remove(user);
+  }
+}`,
+};
+
+// Complete file contents for UserService - new version with Redis and Logger
+const USER_SERVICE_NEW: FileContents = {
+	name: "src/services/UserService.ts",
+	contents: `import { Injectable } from '@nestjs/common';
+import { Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+import { User } from '../entities/User';
+import { EmailService } from './EmailService';
+import { RedisService } from './RedisService';
+import { LoggerService } from './LoggerService';
+
+@Injectable()
+export class UserService {
+  constructor(
+    @InjectRepository(User)
+    private userRepo: Repository<User>,
+    private redis: RedisService,
+    private logger: LoggerService,
+    private emailService: EmailService,
+  ) {}
+
+  async findById(id: string): Promise<User | null> {
+    this.logger.log('Finding user: ' + id);
+    const cached = await this.redis.get('user:' + id);
+    if (cached) return JSON.parse(cached);
+    const user = await this.userRepo.findOne({ where: { id } });
+    if (user) await this.redis.setex('user:' + id, 3600, JSON.stringify(user));
+    return user;
+  }
+
+  async findByEmail(email: string): Promise<User | null> {
+    return this.userRepo.findOne({ where: { email } });
+  }
+
+  async create(data: CreateUserDto): Promise<User> {
+    this.logger.log('Creating user: ' + data.email);
+    const user = this.userRepo.create(data);
+    const saved = await this.userRepo.save(user);
+    await this.redis.setex('user:' + saved.id, 3600, JSON.stringify(saved));
+    return saved;
+  }
+
+  async update(id: string, data: UpdateUserDto): Promise<User> {
+    const user = await this.findById(id);
+    if (!user) {
+      throw new Error('User not found');
+    }
+    Object.assign(user, data);
+    return this.userRepo.save(user);
+  }
+
+  async delete(id: string): Promise<void> {
+    this.logger.log('Deleting user: ' + id);
+    const user = await this.findById(id);
+    if (!user) throw new Error('User not found');
+    await this.userRepo.remove(user);
+    await this.redis.del('user:' + id);
+  }
+}`,
+};
+
+// Complete file contents for ApiService - old version
+const API_SERVICE_OLD: FileContents = {
+	name: "src/services/ApiService.ts",
+	contents: `import axios from 'axios';
+
+const API_BASE_URL = process.env.API_URL || 'http://localhost:3000';
+
+export interface ApiConfig {
+  baseURL: string;
+  timeout: number;
+}
+
+export class ApiService {
+  private client = axios.create({
+    baseURL: API_BASE_URL,
+    timeout: 30000,
+  });
+
+  constructor(
+    private config: ApiConfig,
+  ) {}
+
+  async get<T>(path: string): Promise<T> {
+    const response = await this.client.get<T>(path);
+    return response.data;
+  }
+
+  async post<T>(path: string, data: unknown): Promise<T> {
+    const response = await this.client.post<T>(path, data);
+    return response.data;
+  }
+
+  async put<T>(path: string, data: unknown): Promise<T> {
+    const response = await this.client.put<T>(path, data);
+    return response.data;
+  }
+
+  async delete<T>(path: string): Promise<T> {
+    const response = await this.client.delete<T>(path);
+    return response.data;
+  }
+
+  private handleError(error: unknown): never {
+    if (axios.isAxiosError(error)) {
+      throw new Error(error.response?.data?.message || error.message);
+    }
+    throw error;
+  }
+}`,
+};
+
+// Complete file contents for ApiService - new version with metrics
+const API_SERVICE_NEW: FileContents = {
+	name: "src/services/ApiService.ts",
+	contents: `import axios from 'axios';
+import { MetricsService } from './MetricsService';
+import { ErrorReporter } from './ErrorReporter';
+
+const API_BASE_URL = process.env.API_URL || 'http://localhost:3000';
+
+export interface ApiConfig {
+  baseURL: string;
+  timeout: number;
+}
+
+export class ApiService {
+  private client = axios.create({
+    baseURL: API_BASE_URL,
+    timeout: 30000,
+    headers: {
+      'X-API-Version': 'v2',
+    }
+  });
+
+  constructor(
+    private config: ApiConfig,
+    private metrics: MetricsService,
+    private errorReporter: ErrorReporter,
+  ) {}
+
+  async get<T>(path: string): Promise<T> {
+    const response = await this.client.get<T>(path);
+    return response.data;
+  }
+
+  async post<T>(path: string, data: unknown): Promise<T> {
+    this.metrics.increment('api.post');
+    const response = await this.client.post<T>(path, data);
+    this.metrics.timing('api.post.duration', response.config.timeout || 0);
+    return response.data;
+  }
+
+  async put<T>(path: string, data: unknown): Promise<T> {
+    const response = await this.client.put<T>(path, data);
+    return response.data;
+  }
+
+  async delete<T>(path: string): Promise<T> {
+    const response = await this.client.delete<T>(path);
+    return response.data;
+  }
+
+  private handleError(error: unknown): never {
+    this.errorReporter.report(error);
+    if (axios.isAxiosError(error)) {
+      this.metrics.increment('api.error');
+      throw new Error(error.response?.data?.message || error.message);
+    }
+    this.metrics.increment('api.unknown_error');
+    throw error;
+  }
+}`,
+};
+
+// New auth hook file (no old version since it's added)
+const AUTH_HOOK_NEW: FileContents = {
+	name: "src/hooks/useAuth.ts",
+	contents: `import { useState, useEffect, createContext, useContext } from 'react';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  login: (email: string, password: string) => Promise<void>;
+  logout: () => void;
+  isLoading: boolean;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem('auth_token');
+    if (token) {
+      validateToken(token).then(setUser).finally(() => setIsLoading(false));
+    } else {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const login = async (email: string, password: string) => {
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    const { token, user } = await response.json();
+    localStorage.setItem('auth_token', token);
+    setUser(user);
+  };
+
+  const logout = () => {
+    localStorage.removeItem('auth_token');
+    setUser(null);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, login, logout, isLoading }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
+  return context;
+};
+
+async function validateToken(token: string): Promise<User> {
+  const response = await fetch('/api/auth/validate', {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  if (!response.ok) {
+    localStorage.removeItem('auth_token');
+    throw new Error('Invalid token');
+  }
+  return response.json();
+}`,
+};
 
 function App() {
 	const [activeTab, setActiveTab] = useState<"changes" | "history">("changes");
 	const [files, setFiles] = useState<FileChange[]>([
-		{ id: "1", name: "src/services/UserService.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_1 },
-		{ id: "2", name: "src/services/ApiService.ts", checked: true, status: "modified", patch: SAMPLE_DIFF_2 },
-		{ id: "3", name: "src/hooks/useAuth.ts", checked: false, status: "added", patch: SAMPLE_DIFF_3 },
+		{ id: "1", name: "src/services/UserService.ts", checked: true, status: "modified", oldFile: USER_SERVICE_OLD, newFile: USER_SERVICE_NEW },
+		{ id: "2", name: "src/services/ApiService.ts", checked: true, status: "modified", oldFile: API_SERVICE_OLD, newFile: API_SERVICE_NEW },
+		{ id: "3", name: "src/hooks/useAuth.ts", checked: false, status: "added", oldFile: null, newFile: AUTH_HOOK_NEW },
 	]);
 	const [commitSummary, setCommitSummary] = useState("");
 	const [commitDescription, setCommitDescription] = useState("");
@@ -254,18 +363,14 @@ function App() {
 		setExpandedFiles(new Set());
 	};
 
-	const countLinesChanged = (patch: string) => {
-		const lines = patch.split('\n');
-		let added = 0;
-		let deleted = 0;
-		for (const line of lines) {
-			if (line.startsWith('+') && !line.startsWith('+++')) {
-				added++;
-			} else if (line.startsWith('-') && !line.startsWith('---')) {
-				deleted++;
-			}
-		}
-		return { added, deleted };
+	const countLinesChanged = (oldFile: FileContents | null, newFile: FileContents) => {
+		// Simple line count comparison
+		const oldLines = oldFile ? oldFile.contents.split('\n').length : 0;
+		const newLines = newFile.contents.split('\n').length;
+		const added = Math.max(0, newLines - oldLines);
+		const deleted = Math.max(0, oldLines - newLines);
+		// This is approximate - real diff would be more accurate
+		return { added: newLines - (oldFile ? 0 : newLines) + added, deleted: oldFile ? deleted : 0 };
 	};
 
 	const getStatusIcon = (status: FileChange["status"]) => {
@@ -448,7 +553,9 @@ function App() {
 					{activeTab === "changes" && (
 						<>
 							<div className="flex-1 overflow-auto py-2 scrollbar-stable">
-								{files.map((file) => (
+								{files.map((file) => {
+									const lineCount = countLinesChanged(file.oldFile, file.newFile);
+									return (
 									<div
 										key={file.id}
 										onClick={() => toggleFile(file.id)}
@@ -462,8 +569,17 @@ function App() {
 										/>
 										{getStatusIcon(file.status)}
 										<span className="text-sm text-gray-700 dark:text-gray-300 truncate">{file.name}</span>
+										<div className="flex items-center gap-1.5 text-xs ml-auto">
+											{lineCount.added > 0 && (
+												<span className="text-green-600 dark:text-green-400 font-medium">+{lineCount.added}</span>
+											)}
+											{lineCount.deleted > 0 && (
+												<span className="text-red-600 dark:text-red-400 font-medium">-{lineCount.deleted}</span>
+											)}
+										</div>
 									</div>
-								))}
+									);
+								})}
 							</div>
 
 							<div className="border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-900">
@@ -527,7 +643,7 @@ function App() {
 									>
 										{isCopied ? "Copied!" : "Copy notes"}
 									</button>
-								)}
+									)}
 								<button
 									onClick={toggleAll}
 									className="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md transition-colors"
@@ -556,53 +672,54 @@ function App() {
 								</div>
 							) : (
 								<>
-									{checkedFiles.map((file) => {
-										const lineCount = countLinesChanged(file.patch);
-										return (
-										<div key={file.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-											<button
-												onClick={() => toggleFileExpand(file.id)}
-												className={`w-full bg-gray-100 dark:bg-gray-700 px-2.5 py-1 flex items-center justify-between hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors ${
-													expandedFiles.has(file.id) ? 'border-b border-gray-200 dark:border-gray-600' : ''
-												}`}
-											>
-												<div className="flex items-center gap-1.5">
-													<svg
-														className={`w-3 h-3 text-gray-500 dark:text-gray-400 transition-transform ${expandedFiles.has(file.id) ? 'rotate-180' : ''}`}
-														fill="none"
-														stroke="currentColor"
-														viewBox="0 0 24 24"
-													>
-														<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-													</svg>
-													{getStatusIcon(file.status)}
-													<span className="font-mono text-xs text-gray-700 dark:text-gray-300">{file.name}</span>
-												</div>
-												<div className="flex items-center gap-1.5 text-xs">
-													{lineCount.added > 0 && (
-														<span className="text-green-600 dark:text-green-400 font-medium">+{lineCount.added}</span>
-													)}
-													{lineCount.deleted > 0 && (
-														<span className="text-red-600 dark:text-red-400 font-medium">-{lineCount.deleted}</span>
-													)}
-												</div>
-											</button>
-											{expandedFiles.has(file.id) && (
-												<PatchDiff
-													patch={file.patch}
-													options={{
-														theme: isDarkMode ? "pierre-dark" : "pierre-light",
-														diffStyle: "split",
-														enableLineSelection: true,
-														disableFileHeader: true,
-														hunkSeparators: "line-info",
-														onLineSelectionEnd: handleLineSelectionEnd(file.name),
-													}}
-												/>
-											)}
-										</div>
-										);
-									})}
+								{checkedFiles.map((file) => {
+									const fileDiff = useMemo(() => {
+										if (file.oldFile) {
+											return parseDiffFromFile(file.oldFile, file.newFile);
+										}
+										// For new files, create a diff with empty old file
+										const emptyOldFile: FileContents = {
+											name: file.newFile.name,
+											contents: ""
+										};
+										return parseDiffFromFile(emptyOldFile, file.newFile);
+									}, [file]);
+									return (
+									<div key={file.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+										<button
+											onClick={() => toggleFileExpand(file.id)}
+											className={`w-full bg-gray-100 dark:bg-gray-700 px-2.5 py-1 flex items-center justify-between hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors ${
+												expandedFiles.has(file.id) ? 'border-b border-gray-200 dark:border-gray-600' : ''
+											}`}
+										>
+											<div className="flex items-center gap-1.5">
+												<svg
+													className={`w-3 h-3 text-gray-500 dark:text-gray-400 transition-transform ${expandedFiles.has(file.id) ? 'rotate-180' : ''}`}
+													fill="none"
+													stroke="currentColor"
+													viewBox="0 0 24 24"
+												>
+													<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+												</svg>
+												{getStatusIcon(file.status)}
+												<span className="font-mono text-xs text-gray-700 dark:text-gray-300">{file.name}</span>
+											</div>
+										</button>
+										{expandedFiles.has(file.id) && (
+											<FileDiff
+												fileDiff={fileDiff}
+												options={{
+													theme: isDarkMode ? "pierre-dark" : "pierre-light",
+													diffStyle: "split",
+													enableLineSelection: true,
+													disableFileHeader: true,
+													onLineSelectionEnd: handleLineSelectionEnd(file.name),
+												}}
+											/>
+										)}
+									</div>
+									);
+								})}
 								</>
 							)}
 						</div>
