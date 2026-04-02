@@ -61,6 +61,49 @@ interface GitRPCSchema {
       stageFile: { params: { path: string }; response: void };
       unstageFile: { params: { path: string }; response: void };
       commit: { params: { message: string }; response: void };
+      getCommitHistory: { params: { count?: number }; response: Array<{
+        hash: string;
+        message: string;
+        author: string;
+        date: string;
+        branches: string[];
+        isHead: boolean;
+      }> };
+      getCommitGraph: { params: { offset?: number; count?: number }; response: Array<{
+        hash: string;
+        message: string;
+        author: string;
+        date: string;
+        parents: string[];
+        branches: string[];
+        isHead: boolean;
+      }> };
+      getCommitDetails: { params: { hash: string }; response: {
+        hash: string;
+        message: string;
+        body: string;
+        author: string;
+        authorEmail: string;
+        date: string;
+        files: Array<{
+          path: string;
+          status: string;
+          additions: number;
+          deletions: number;
+        }>;
+        stats: {
+          filesChanged: number;
+          insertions: number;
+          deletions: number;
+        };
+      } | null };
+      getBranches: { params: void; response: Array<{
+        name: string;
+        isCurrent: boolean;
+        isRemote: boolean;
+        ahead: number;
+        behind: number;
+      }> };
       // System
       getHomeDirectory: { params: void; response: string };
     };
@@ -163,6 +206,42 @@ const gitRpc = BrowserView.defineRPC<GitRPCSchema>({
           throw new Error("No active repository");
         }
         gitService.commit(message);
+      },
+      getCommitHistory: ({ count }) => {
+        const gitService = repoManager.getGitService();
+        if (!gitService) return [];
+        try {
+          return gitService.getCommitHistory(count || 50);
+        } catch {
+          return [];
+        }
+      },
+      getCommitGraph: ({ offset, count }) => {
+        const gitService = repoManager.getGitService();
+        if (!gitService) return [];
+        try {
+          return gitService.getCommitGraph(offset || 0, count || 100);
+        } catch {
+          return [];
+        }
+      },
+      getCommitDetails: ({ hash }) => {
+        const gitService = repoManager.getGitService();
+        if (!gitService) return null;
+        try {
+          return gitService.getCommitDetails(hash);
+        } catch {
+          return null;
+        }
+      },
+      getBranches: () => {
+        const gitService = repoManager.getGitService();
+        if (!gitService) return [];
+        try {
+          return gitService.getBranches();
+        } catch {
+          return [];
+        }
       },
     },
   },

@@ -214,22 +214,242 @@ export class GitService {
 		this.execGit(["commit", "-m", message]);
 	}
 
-	getCommitHistory(count: number = 20): Array<{
+	getCommitHistory(count: number = 50): Array<{
 		hash: string;
 		message: string;
 		author: string;
 		date: string;
+		branches: string[];
+		isHead: boolean;
 	}> {
-		const output = this.execGit([
+		// Get commit log with graph
+		const logOutput = this.execGit([
 			"log",
+			"--all",
+			"--graph",
+			"--decorate",
+			"--oneline",
+			"--format='%H|%s|%an|%ai|%D'",
 			`-${count}`,
-			"--pretty=format:%H|%s|%an|%ai",
 		]);
 
-    return output.split("\n").map((line) => {
-			const [hash, message, author, date] = line.split("|");
-			return { hash, message, author, date };
+		const lines = logOutput.split("\n").filter(line => line.trim());
+		
+		return lines.map((line) => {
+			// Strip leading/trailing quotes if present
+			const cleanLine = line.replace(/^'|'$/g, "");
+			const parts = cleanLine.split("|");
+			// Handle the graph characters at the start
+			const hash = parts[0]?.replace(/^[\s*|\/\\-]+/, "").trim() || "";
+			const message = parts[1] || "";
+			const author = parts[2] || "";
+			const date = parts[3] || "";
+			const decorations = parts[4] || "";
+			
+			// Parse branches from decorations
+			const branches: string[] = [];
+			const isHead = decorations.includes("HEAD");
+			
+			// Extract branch names from decorations (format: "HEAD -> branch-name, origin/branch-name")
+			const branchMatch = decorations.match(/(?:HEAD -> )?([^,\s]+)/g);
+			if (branchMatch) {
+				branchMatch.forEach(b => {
+					if (!b.includes("HEAD")) {
+						branches.push(b.replace("origin/", ""));
+					}
+				});
+			}
+			
+			return { hash, message, author, date, branches, isHead };
+		}).filter(c => c.hash);
+	}
+
+	getBranches(): Array<{
+		name: string;
+		isCurrent: boolean;
+		isRemote: boolean;
+		ahead: number;
+		behind: number;
+	}> {
+		// Get branch list with verbose info
+		const output = this.execGit([
+			"branch",
+			"-vv",
+		]);
+
+		return output.split("\n").filter(line => line.trim()).map((line) => {
+			// Parse line like: * main                abc1234 [origin/main: ahead 2, behind 1] commit message
+			// or:   feature            abc1234 commit message
+			const isCurrent = line.trim().startsWith("*");
+			const cleanLine = line.replace(/^\*?\s*/, "");
+			
+			// Extract branch name (first word)
+			const nameMatch = cleanLine.match(/^(\S+)/);
+			const name = nameMatch ? nameMatch[1] : "";
+			
+			// Check if remote branch
+			const isRemote = name.startsWith("origin/");
+			
+			// Extract ahead/behind from bracket notation [origin/main: ahead 2, behind 1]
+			let ahead = 0;
+			let behind = 0;
+			const bracketMatch = cleanLine.match(/\[.+?:\s*(ahead\s*(\d+))?\s*,?\s*(behind\s*(\d+))?\]/);
+			if (bracketMatch) {
+				ahead = parseInt(bracketMatch[2]) || 0;
+				behind = parseInt(bracketMatch[4]) || 0;
+			}
+			
+			return {
+				name,
+				isCurrent,
+				isRemote,
+				ahead,
+				behind,
+			};
 		});
+	}
+
+	getCommitGraph(offset: number = 0, count: number = 100): Array<{
+		hash: string;
+		message: string;
+		author: string;
+		date: string;
+		parents: string[];
+		branches: string[];
+		isHead: boolean;
+	}> {
+		// Get log with parent hashes for building graph structure
+		const logOutput = this.execGit([
+			"log",
+			"--all",
+			"--decorate",
+			"--format='%H|%P|%s|%an|%ai|%D'",
+			"--skip", offset.toString(),
+			"-n", count.toString(),
+		]);
+
+		const lines = logOutput.split("\n").filter(line => line.trim());
+		
+		return lines.map((line) => {
+			// Strip leading/trailing quotes if present
+			const cleanLine = line.replace(/^'|'$/g, "");
+			const parts = cleanLine.split("|");
+			
+			const hash = parts[0] || "";
+			const parents = parts[1] ? parts[1].split(" ").filter(p => p) : [];
+			const message = parts[2] || "";
+			const author = parts[3] || "";
+			const date = parts[4] || "";
+			const decorations = parts[5] || "";
+			
+			// Parse branches from decorations
+			const branches: string[] = [];
+			const isHead = decorations.includes("HEAD");
+			
+			// Extract branch names from decorations
+			const branchMatches = decorations.match(/(?:HEAD\s*->\s*)?([^,\s(]+)/g);
+			if (branchMatches) {
+				branchMatches.forEach(b => {
+					const cleanBranch = b.replace("HEAD -> ", "").replace("origin/", "").trim();
+					if (cleanBranch && !cleanBranch.includes("tag:") && !branches.includes(cleanBranch)) {
+						branches.push(cleanBranch);
+					}
+				});
+			}
+			
+			return { hash, message, author, date, parents, branches, isHead };
+		}).filter(c => c.hash);
+	}
+
+	getCommitDetails(hash: string): {
+		hash: string;
+		message: string;
+		body: string;
+		author: string;
+		authorEmail: string;
+		date: string;
+		files: Array<{
+			path: string;
+			status: string;
+			additions: number;
+			deletions: number;
+		}>;
+		stats: {
+			filesChanged: number;
+			insertions: number;
+			deletions: number;
+		};
+	} | null {
+		try {
+			// Get commit info
+			const infoOutput = this.execGit([
+				"show",
+				"--format='%H|%s|%b|%an|%ae|%ai'",
+				"--no-patch",
+				hash,
+			]);
+			
+			const infoLine = infoOutput.replace(/^'|'$/g, "");
+			const [commitHash, subject, body, author, authorEmail, date] = infoLine.split("|");
+			
+			// Get file changes
+			const statOutput = this.execGit([
+				"show",
+				"--format=''",
+				"--stat",
+				hash,
+			]);
+			
+			// Parse stats
+			let filesChanged = 0;
+			let insertions = 0;
+			let deletions = 0;
+			
+			const statMatch = statOutput.match(/(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/);
+			if (statMatch) {
+				filesChanged = parseInt(statMatch[1]) || 0;
+				insertions = parseInt(statMatch[2]) || 0;
+				deletions = parseInt(statMatch[3]) || 0;
+			}
+			
+			// Parse file list
+			const files: Array<{path: string; status: string; additions: number; deletions: number}> = [];
+			const fileLines = statOutput.split("\n").filter(l => l.includes("|"));
+			fileLines.forEach(line => {
+				const match = line.match(/^(.+)\s*\|\s*(\d+)\s*([\-+]*)/);
+				if (match) {
+					const path = match[1].trim();
+					const changes = match[2];
+					const signs = match[3];
+					const adds = (signs.match(/\+/g) || []).length;
+					const dels = (signs.match(/-/g) || []).length;
+					files.push({
+						path,
+						status: "modified", // Could be improved by checking actual status
+						additions: adds || parseInt(changes) || 0,
+						deletions: dels || 0,
+					});
+				}
+			});
+			
+			return {
+				hash: commitHash || hash,
+				message: subject || "",
+				body: body || "",
+				author: author || "",
+				authorEmail: authorEmail || "",
+				date: date || "",
+				files,
+				stats: {
+					filesChanged,
+					insertions,
+					deletions,
+				},
+			};
+		} catch (error) {
+			console.error("Failed to get commit details:", error);
+			return null;
+		}
 	}
 
 	private execGit(args: string[]): string {

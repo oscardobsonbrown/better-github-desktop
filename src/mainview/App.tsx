@@ -1,9 +1,10 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import type { SelectedLineRange, FileContents, FileDiffMetadata } from "@pierre/diffs";
 import { ArrowsInSimple, ArrowsOutSimple, FolderOpen, Plus, Download, Rows, SquaresFour } from "@phosphor-icons/react";
 import { Electroview } from "electrobun/view";
+import { Gitgraph, TemplateName } from "@gitgraph/react";
 
 // RPC type definitions matching backend
 interface Repository {
@@ -31,6 +32,41 @@ interface GitRPCSchema {
       stageFile: { params: { path: string }; response: void };
       unstageFile: { params: { path: string }; response: void };
       commit: { params: { message: string }; response: void };
+      getCommitGraph: { params: { offset?: number; count?: number }; response: Array<{
+        hash: string;
+        message: string;
+        author: string;
+        date: string;
+        parents: string[];
+        branches: string[];
+        isHead: boolean;
+      }> };
+      getCommitDetails: { params: { hash: string }; response: {
+        hash: string;
+        message: string;
+        body: string;
+        author: string;
+        authorEmail: string;
+        date: string;
+        files: Array<{
+          path: string;
+          status: string;
+          additions: number;
+          deletions: number;
+        }>;
+        stats: {
+          filesChanged: number;
+          insertions: number;
+          deletions: number;
+        };
+      } | null };
+      getBranches: { params: void; response: Array<{
+        name: string;
+        isCurrent: boolean;
+        isRemote: boolean;
+        ahead: number;
+        behind: number;
+      }> };
       // System
       getHomeDirectory: { params: void; response: string };
     };
@@ -518,6 +554,455 @@ function RepoManager({
   );
 }
 
+// Types for commit graph
+interface CommitNode {
+  hash: string;
+  message: string;
+  author: string;
+  date: string;
+  parents: string[];
+  branches: string[];
+  isHead: boolean;
+}
+
+interface BranchInfo {
+  name: string;
+  isCurrent: boolean;
+  isRemote: boolean;
+  ahead: number;
+  behind: number;
+}
+
+// Branch colors for visualization
+const BRANCH_COLORS = [
+  { bg: "#3b82f6", text: "#ffffff" }, // blue
+  { bg: "#22c55e", text: "#ffffff" }, // green
+  { bg: "#a855f7", text: "#ffffff" }, // purple
+  { bg: "#f97316", text: "#ffffff" }, // orange
+  { bg: "#ec4899", text: "#ffffff" }, // pink
+  { bg: "#eab308", text: "#000000" }, // yellow
+  { bg: "#06b6d4", text: "#ffffff" }, // cyan
+  { bg: "#ef4444", text: "#ffffff" }, // red
+];
+
+// Format date - show relative time for recent commits
+const formatDate = (dateStr: string) => {
+  try {
+    if (!dateStr || dateStr.trim() === "" || dateStr === "null" || dateStr === "undefined") {
+      return "";
+    }
+    
+    // Git returns dates in format: "2024-01-15 14:30:00 +0100"
+    // or ISO format: "2024-01-15T14:30:00+01:00"
+    // Handle both
+    let normalizedDate = dateStr.trim();
+    
+    // Replace space with T if it looks like git format
+    if (normalizedDate.match(/^\d{4}-\d{2}-\d{2}\s/)) {
+      normalizedDate = normalizedDate.replace(" ", "T");
+      // Insert colon in timezone if missing (+0100 -> +01:00)
+      normalizedDate = normalizedDate.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+    }
+    
+    const date = new Date(normalizedDate);
+    if (isNaN(date.getTime())) {
+      return "";
+    }
+    
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    
+    return date.toLocaleDateString(undefined, { 
+      month: "short", 
+      day: "numeric",
+      year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined
+    });
+  } catch {
+    return "";
+  }
+};
+
+// Format full date for tooltip
+const formatFullDate = (dateStr: string) => {
+  try {
+    if (!dateStr || dateStr.trim() === "") return "";
+    
+    let normalizedDate = dateStr.trim();
+    if (normalizedDate.match(/^\d{4}-\d{2}-\d{2}\s/)) {
+      normalizedDate = normalizedDate.replace(" ", "T");
+      normalizedDate = normalizedDate.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+    }
+    
+    const date = new Date(normalizedDate);
+    if (isNaN(date.getTime())) return "";
+    
+    return date.toLocaleDateString(undefined, {
+      month: "long",
+      day: "numeric",
+      year: "numeric"
+    }) + " at " + date.toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit"
+    });
+  } catch {
+    return "";
+  }
+};
+
+// Format hash (short)
+const formatHash = (hash: string) => {
+  return hash.substring(0, 7);
+};
+
+// Commit History Component using GitGraph.js
+function CommitHistory({ 
+  repoStatus 
+}: { 
+  repoStatus: { isRepo: boolean; branch: string; ahead: number; behind: number } | null;
+}) {
+  const [commits, setCommits] = useState<CommitNode[]>([]);
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [selectedCommit, setSelectedCommit] = useState<CommitNode | null>(null);
+  const [commitDetails, setCommitDetails] = useState<any>(null);
+  const [hoveredCommit, setHoveredCommit] = useState<CommitNode | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const gitgraphRef = useRef<any>(null);
+
+  // Initial load
+  useEffect(() => {
+    loadCommitHistory(0, true);
+  }, []);
+
+  // Infinite scroll observer
+  useEffect(() => {
+    if (!containerRef.current) return;
+    
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !isLoading) {
+          loadCommitHistory(offset, false);
+        }
+      },
+      { threshold: 0.1 }
+    );
+    
+    const sentinel = containerRef.current.querySelector(".scroll-sentinel");
+    if (sentinel) {
+      observer.observe(sentinel);
+    }
+    
+    return () => observer.disconnect();
+  }, [hasMore, isLoading, offset]);
+
+  const loadCommitHistory = async (currentOffset: number, reset: boolean = false) => {
+    if (isLoading) return;
+    
+    setIsLoading(true);
+    try {
+      const [commitData, branchData] = await Promise.all([
+        gitRPC.request.getCommitGraph({ offset: currentOffset, count: 100 }),
+        gitRPC.request.getBranches(),
+      ]);
+      
+      if (reset) {
+        setCommits(commitData);
+      } else {
+        setCommits(prev => [...prev, ...commitData]);
+      }
+      
+      setBranches(branchData);
+      setOffset(currentOffset + commitData.length);
+      setHasMore(commitData.length === 100);
+    } catch (err) {
+      console.error("Failed to load commit history:", err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Get color for a branch
+  const getBranchColor = (branchName: string) => {
+    const index = branches.findIndex(b => b.name === branchName);
+    return BRANCH_COLORS[index % BRANCH_COLORS.length];
+  };
+
+  // Handle commit click - load details
+  const handleCommitClick = async (commit: CommitNode) => {
+    setSelectedCommit(commit);
+    try {
+      const details = await gitRPC.request.getCommitDetails({ hash: commit.hash });
+      setCommitDetails(details);
+    } catch (err) {
+      console.error("Failed to load commit details:", err);
+    }
+  };
+
+  // Convert commits to GitGraph format
+  const buildGitGraph = (gitgraph: any) => {
+    if (!commits.length) return;
+    
+    // Create branches map
+    const branchMap = new Map<string, any>();
+    const processedCommits = new Set<string>();
+    
+    // First pass: identify branch heads
+    const branchHeads = new Map<string, string>();
+    commits.forEach(commit => {
+      commit.branches.forEach(branch => {
+        if (!branchHeads.has(branch)) {
+          branchHeads.set(branch, commit.hash);
+        }
+      });
+    });
+    
+    // Create main branch first (usually the current branch)
+    const mainBranchName = repoStatus?.branch || "main";
+    const mainBranch = gitgraph.branch({
+      name: mainBranchName,
+      style: {
+        color: getBranchColor(mainBranchName).bg,
+        lineWidth: 3,
+      },
+    });
+    branchMap.set(mainBranchName, mainBranch);
+    
+    // Track which branch each commit belongs to
+    const commitBranchMap = new Map<string, string>();
+    
+    commits.forEach((commit) => {
+      if (processedCommits.has(commit.hash)) return;
+      
+      // Determine which branch this commit belongs to
+      let branchName = commit.branches[0] || mainBranchName;
+      
+      // If this commit has parents, find the right branch
+      if (commit.parents.length > 0) {
+        // Check if any parent is already processed
+        const parentBranch = commit.parents
+          .map(p => commitBranchMap.get(p))
+          .find(b => b !== undefined);
+        if (parentBranch) {
+          branchName = parentBranch;
+        }
+      }
+      
+      commitBranchMap.set(commit.hash, branchName);
+      
+      // Get or create branch
+      let branch = branchMap.get(branchName);
+      if (!branch) {
+        // Create new branch from a parent
+        const parentHash = commit.parents[0];
+        const parentBranch = parentHash ? branchMap.get(commitBranchMap.get(parentHash) || mainBranchName) : mainBranch;
+        
+        branch = (parentBranch || mainBranch).branch({
+          name: branchName,
+          style: {
+            color: getBranchColor(branchName).bg,
+            lineWidth: 3,
+          },
+        });
+        branchMap.set(branchName, branch);
+      }
+      
+      // Add commit to branch
+      branch.commit({
+        hash: commit.hash,
+        subject: commit.message,
+        author: commit.author,
+        style: {
+          color: getBranchColor(branchName).bg,
+          message: {
+            color: "#374151",
+            display: true,
+          },
+        },
+        onClick: () => handleCommitClick(commit),
+        onMouseOver: () => setHoveredCommit(commit),
+        onMouseOut: () => setHoveredCommit(null),
+      });
+      
+      processedCommits.add(commit.hash);
+    });
+  };
+
+  if (isLoading && commits.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-500">
+        <div className="text-center">
+          <svg className="w-8 h-8 mx-auto mb-2 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <p className="text-sm">Loading commit history...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 flex overflow-hidden">
+      {/* GitGraph visualization */}
+      <div 
+        ref={containerRef}
+        className="flex-1 overflow-auto bg-white dark:bg-gray-900 relative"
+      >
+        {commits.length > 0 ? (
+          <Gitgraph 
+            options={{
+              template: TemplateName.BlackArrow,
+            }}
+          >
+            {(gitgraph: any) => {
+              gitgraphRef.current = gitgraph;
+              buildGitGraph(gitgraph);
+              return null;
+            }}
+          </Gitgraph>
+        ) : (
+          <div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+            <div className="text-center">
+              <svg className="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <p className="text-sm">No commits found</p>
+            </div>
+          </div>
+        )}
+        
+        {/* Infinite scroll sentinel */}
+        {hasMore && (
+          <div className="scroll-sentinel h-10 flex items-center justify-center">
+            {isLoading && (
+              <svg className="w-6 h-6 animate-spin text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            )}
+          </div>
+        )}
+        
+        {/* Hover tooltip */}
+        {hoveredCommit && (
+          <div className="absolute z-50 bg-gray-900 dark:bg-gray-800 text-white p-3 rounded-lg shadow-lg max-w-md pointer-events-none"
+               style={{ 
+                 left: "20px", 
+                 top: "20px",
+               }}>
+            <div className="font-medium text-sm mb-1">{hoveredCommit.author}</div>
+            <div className="text-xs text-gray-400 mb-2">
+              {formatDate(hoveredCommit.date)} ({formatFullDate(hoveredCommit.date)})
+            </div>
+            <div className="text-sm mb-2">{hoveredCommit.message}</div>
+            <div className="text-xs text-gray-400 font-mono">{formatHash(hoveredCommit.hash)}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Selected commit details sidebar */}
+      {selectedCommit && (
+        <div className="w-96 border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 p-4 overflow-auto">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-gray-900 dark:text-white">Commit Details</h3>
+            <button 
+              onClick={() => setSelectedCommit(null)}
+              className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          
+          <div className="space-y-4">
+            <div>
+              <div className="font-medium text-sm text-gray-900 dark:text-white mb-1">
+                {selectedCommit.author}
+              </div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">
+                {formatDate(selectedCommit.date)} ({formatFullDate(selectedCommit.date)})
+              </div>
+            </div>
+            
+            <div>
+              <p className="text-sm text-gray-900 dark:text-white font-medium">
+                {selectedCommit.message}
+              </p>
+              {commitDetails?.body && (
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-2 whitespace-pre-wrap">
+                  {commitDetails.body}
+                </p>
+              )}
+            </div>
+            
+            {commitDetails?.stats && (
+              <div className="text-sm">
+                <span className="text-gray-700 dark:text-gray-300">
+                  {commitDetails.stats.filesChanged} file{commitDetails.stats.filesChanged !== 1 ? 's' : ''} changed
+                </span>
+                {commitDetails.stats.insertions > 0 && (
+                  <span className="text-green-600 dark:text-green-400 ml-2">
+                    +{commitDetails.stats.insertions}
+                  </span>
+                )}
+                {commitDetails.stats.deletions > 0 && (
+                  <span className="text-red-600 dark:text-red-400 ml-2">
+                    -{commitDetails.stats.deletions}
+                  </span>
+                )}
+              </div>
+            )}
+            
+            {commitDetails?.files && commitDetails.files.length > 0 && (
+              <div>
+                <label className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Changed Files</label>
+                <div className="mt-2 space-y-1 max-h-60 overflow-auto">
+                  {commitDetails.files.map((file: any) => (
+                    <div key={file.path} className="flex items-center justify-between text-sm">
+                      <span className="text-gray-700 dark:text-gray-300 truncate">{file.path}</span>
+                      <div className="flex gap-2 text-xs">
+                        {file.additions > 0 && (
+                          <span className="text-green-600 dark:text-green-400">+{file.additions}</span>
+                        )}
+                        {file.deletions > 0 && (
+                          <span className="text-red-600 dark:text-red-400">-{file.deletions}</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            
+            <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
+              <div className="font-mono text-xs text-gray-500 dark:text-gray-400 mb-2">
+                {selectedCommit.hash}
+              </div>
+              <a 
+                href={`https://github.com/${repoStatus?.branch}/commit/${selectedCommit.hash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Open on GitHub →
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<"changes" | "history">("changes");
   const [files, setFiles] = useState<FileChange[]>([]);
@@ -672,15 +1157,15 @@ function App() {
   const getStatusIcon = (status: FileChange["status"]) => {
     switch (status) {
       case "modified":
-        return <span className="w-2 h-2 rounded-full bg-yellow-500" />;
+        return <span className="w-2 h-2 rounded-full bg-yellow-500 flex-shrink-0" />;
       case "added":
-        return <span className="w-2 h-2 rounded-full bg-green-500" />;
+        return <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />;
       case "deleted":
-        return <span className="w-2 h-2 rounded-full bg-red-500" />;
+        return <span className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" />;
       case "untracked":
-        return <span className="w-2 h-2 rounded-full bg-gray-400" />;
+        return <span className="w-2 h-2 rounded-full bg-gray-400 flex-shrink-0" />;
       case "staged":
-        return <span className="w-2 h-2 rounded-full bg-blue-500" />;
+        return <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />;
     }
   };
 
@@ -952,14 +1437,9 @@ function App() {
             )}
 
             {activeTab === "history" && (
-              <div className="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-500">
-                <div className="text-center">
-                  <svg className="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  <p className="text-sm">Commit history will appear here</p>
-                </div>
-              </div>
+              <CommitHistory 
+                repoStatus={repoStatus}
+              />
             )}
           </div>
 
