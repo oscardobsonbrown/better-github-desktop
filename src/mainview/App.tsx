@@ -670,6 +670,7 @@ function CommitHistory({
   const [commits, setCommits] = useState<CommitNode[]>([]);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(true);
   const [selectedCommit, setSelectedCommit] = useState<CommitNode | null>(null);
@@ -704,14 +705,20 @@ function CommitHistory({
   }, [hasMore, isLoading, offset]);
 
   const loadCommitHistory = async (currentOffset: number, reset: boolean = false) => {
-    if (isLoading) return;
+    if (isLoading && !reset) return;
     
     setIsLoading(true);
+    setError(null);
+    
     try {
+      console.log("Loading commits at offset:", currentOffset);
       const [commitData, branchData] = await Promise.all([
-        gitRPC.request.getCommitGraph({ offset: currentOffset, count: 20 }), // Load 20 at a time
+        gitRPC.request.getCommitGraph({ offset: currentOffset, count: 20 }),
         gitRPC.request.getBranches(),
       ]);
+      
+      console.log("Loaded commits:", commitData.length);
+      console.log("First commit:", commitData[0]);
       
       if (reset) {
         setCommits(commitData);
@@ -724,6 +731,7 @@ function CommitHistory({
       setHasMore(commitData.length === 20);
     } catch (err) {
       console.error("Failed to load commit history:", err);
+      setError(err instanceof Error ? err.message : "Failed to load commits");
     } finally {
       setIsLoading(false);
     }
@@ -820,6 +828,26 @@ function CommitHistory({
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
           </svg>
           <p className="text-sm">Loading commit history...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-red-500 dark:text-red-400">
+        <div className="text-center">
+          <svg className="w-12 h-12 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+          <p className="text-sm font-medium">Error loading commits</p>
+          <p className="text-xs mt-2 text-gray-500">{error}</p>
+          <button 
+            onClick={() => loadCommitHistory(0, true)}
+            className="mt-4 px-4 py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 rounded-md text-sm hover:bg-gray-800 dark:hover:bg-gray-200"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );
