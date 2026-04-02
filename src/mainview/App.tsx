@@ -4,7 +4,6 @@ import { parseDiffFromFile } from "@pierre/diffs";
 import type { SelectedLineRange, FileContents, FileDiffMetadata } from "@pierre/diffs";
 import { ArrowsInSimple, ArrowsOutSimple, FolderOpen, Plus, Download, Rows, SquaresFour } from "@phosphor-icons/react";
 import { Electroview } from "electrobun/view";
-import { Gitgraph, TemplateName } from "@gitgraph/react";
 
 // RPC type definitions matching backend
 interface Repository {
@@ -677,7 +676,6 @@ function CommitHistory({
   const [commitDetails, setCommitDetails] = useState<any>(null);
   const [hoveredCommit, setHoveredCommit] = useState<CommitNode | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const gitgraphRef = useRef<any>(null);
 
   // Initial load
   useEffect(() => {
@@ -711,7 +709,7 @@ function CommitHistory({
     setIsLoading(true);
     try {
       const [commitData, branchData] = await Promise.all([
-        gitRPC.request.getCommitGraph({ offset: currentOffset, count: 100 }),
+        gitRPC.request.getCommitGraph({ offset: currentOffset, count: 20 }), // Load 20 at a time
         gitRPC.request.getBranches(),
       ]);
       
@@ -723,7 +721,7 @@ function CommitHistory({
       
       setBranches(branchData);
       setOffset(currentOffset + commitData.length);
-      setHasMore(commitData.length === 100);
+      setHasMore(commitData.length === 20);
     } catch (err) {
       console.error("Failed to load commit history:", err);
     } finally {
@@ -748,93 +746,70 @@ function CommitHistory({
     }
   };
 
-  // Convert commits to GitGraph format
-  const buildGitGraph = (gitgraph: any) => {
-    if (!commits.length) return;
-    
-    // Create branches map
-    const branchMap = new Map<string, any>();
-    const processedCommits = new Set<string>();
-    
-    // First pass: identify branch heads
-    const branchHeads = new Map<string, string>();
-    commits.forEach(commit => {
-      commit.branches.forEach(branch => {
-        if (!branchHeads.has(branch)) {
-          branchHeads.set(branch, commit.hash);
-        }
-      });
-    });
-    
-    // Create main branch first (usually the current branch)
-    const mainBranchName = repoStatus?.branch || "main";
-    const mainBranch = gitgraph.branch({
-      name: mainBranchName,
-      style: {
-        color: getBranchColor(mainBranchName).bg,
-        lineWidth: 3,
-      },
-    });
-    branchMap.set(mainBranchName, mainBranch);
-    
-    // Track which branch each commit belongs to
-    const commitBranchMap = new Map<string, string>();
-    
-    commits.forEach((commit) => {
-      if (processedCommits.has(commit.hash)) return;
-      
-      // Determine which branch this commit belongs to
-      let branchName = commit.branches[0] || mainBranchName;
-      
-      // If this commit has parents, find the right branch
-      if (commit.parents.length > 0) {
-        // Check if any parent is already processed
-        const parentBranch = commit.parents
-          .map(p => commitBranchMap.get(p))
-          .find(b => b !== undefined);
-        if (parentBranch) {
-          branchName = parentBranch;
-        }
-      }
-      
-      commitBranchMap.set(commit.hash, branchName);
-      
-      // Get or create branch
-      let branch = branchMap.get(branchName);
-      if (!branch) {
-        // Create new branch from a parent
-        const parentHash = commit.parents[0];
-        const parentBranch = parentHash ? branchMap.get(commitBranchMap.get(parentHash) || mainBranchName) : mainBranch;
-        
-        branch = (parentBranch || mainBranch).branch({
-          name: branchName,
-          style: {
-            color: getBranchColor(branchName).bg,
-            lineWidth: 3,
-          },
-        });
-        branchMap.set(branchName, branch);
-      }
-      
-      // Add commit to branch
-      branch.commit({
-        hash: commit.hash,
-        subject: commit.message,
-        author: commit.author,
-        style: {
-          color: getBranchColor(branchName).bg,
-          message: {
-            color: "#374151",
-            display: true,
-          },
-        },
-        onClick: () => handleCommitClick(commit),
-        onMouseOver: () => setHoveredCommit(commit),
-        onMouseOut: () => setHoveredCommit(null),
-      });
-      
-      processedCommits.add(commit.hash);
-    });
+  // Simplified commit rendering - just show as list for speed
+  const renderCommitList = () => {
+    return (
+      <div className="divide-y divide-gray-200 dark:divide-gray-700">
+        {commits.map((commit) => (
+          <div
+            key={commit.hash}
+            onClick={() => handleCommitClick(commit)}
+            className={`px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer transition-colors ${
+              selectedCommit?.hash === commit.hash ? "bg-blue-50 dark:bg-blue-900/20" : ""
+            }`}
+            onMouseEnter={() => setHoveredCommit(commit)}
+            onMouseLeave={() => setHoveredCommit(null)}
+          >
+            <div className="flex items-start gap-3">
+              {/* Simple graph line */}
+              <div className="flex-shrink-0 w-6 flex flex-col items-center pt-1">
+                <div className={`w-3 h-3 rounded-full ${commit.isHead ? 'bg-blue-500' : 'bg-gray-400 dark:bg-gray-600'}`} />
+                <div className="w-0.5 h-full bg-gray-300 dark:bg-gray-600 mt-1" />
+              </div>
+
+              {/* Commit info */}
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
+                  <span className="font-mono text-xs text-gray-500 dark:text-gray-400">
+                    {formatHash(commit.hash)}
+                  </span>
+                  {commit.isHead && (
+                    <span className="px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 text-xs rounded font-medium">
+                      HEAD
+                    </span>
+                  )}
+                  {commit.branches.slice(0, 3).map((branch) => (
+                    <span
+                      key={branch}
+                      className="px-1.5 py-0.5 text-white text-xs rounded"
+                      style={{ 
+                        backgroundColor: getBranchColor(branch).bg,
+                        color: getBranchColor(branch).text 
+                      }}
+                    >
+                      {branch}
+                    </span>
+                  ))}
+                  {commit.branches.length > 3 && (
+                    <span className="text-xs text-gray-500">
+                      +{commit.branches.length - 3} more
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-gray-900 dark:text-white font-medium leading-snug">
+                  {commit.message}
+                </p>
+                <div className="flex items-center gap-2 mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  <span className="font-medium">{commit.author}</span>
+                  <span>•</span>
+                  <span>{formatDate(commit.date)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
   };
 
   if (isLoading && commits.length === 0) {
@@ -858,17 +833,7 @@ function CommitHistory({
         className="flex-1 overflow-auto bg-white dark:bg-gray-900 relative"
       >
         {commits.length > 0 ? (
-          <Gitgraph 
-            options={{
-              template: TemplateName.BlackArrow,
-            }}
-          >
-            {(gitgraph: any) => {
-              gitgraphRef.current = gitgraph;
-              buildGitGraph(gitgraph);
-              return null;
-            }}
-          </Gitgraph>
+          renderCommitList()
         ) : (
           <div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
             <div className="text-center">
